@@ -20,7 +20,7 @@ from .loader import parse_times
 from .overlap import file_label, find_overlaps, latest_first, overlap_warning
 from .config import NOT_COMPLETED
 from .errors import EmptyUploadError, InvalidFileError, MissingColumnsError, ReportError
-from .mapping import normalise_extension
+from .mapping import department_at, department_extensions, moves_notice, normalise_extension
 
 ProgressFn = Callable[[float, str], None]
 
@@ -158,7 +158,9 @@ def process_ext_stats(
     files = list(files)
     if not files:
         raise EmptyUploadError("No files were uploaded. Please upload at least one XLS/XLSX file.")
-    extensions = sorted(set(mapping.loc[mapping["Department"] == department, "Extension"]), key=_ext_sort_key)
+    # Extensions that belong to the department at some point in the report month. An extension that moved in or
+    # out part-way through the month is listed, but only its legs from the dates it was in the department count.
+    extensions = sorted(department_extensions(mapping, department, period), key=_ext_sort_key)
     if not extensions:
         raise ReportError(f"No extensions are mapped to '{department}' in the department mapping file.")
     dept_exts = set(extensions)
@@ -197,6 +199,7 @@ def process_ext_stats(
         before = len(events)
         events = events.drop_duplicates(["Call ID", "Leg", "Extension", "Side"])
         audit.duplicates_removed = before - len(events)
+    events = events[department_at(mapping, events["Extension"], events["Time"]) == department]  # in dept on that date
     if period is not None:  # the report covers the selected month only (like the PBX report)
         inside = (events["Time"] >= period.start_time) & (events["Time"] <= period.end_time)
         audit.outside_period = int((~inside).sum())
@@ -229,7 +232,7 @@ def process_ext_stats(
 
     if period is None:
         period = pd.Timestamp.now().to_period("M")
-    warnings = []
+    warnings = moves_notice(mapping, period, department)
     cov = coverage_warning(audit.first_call, audit.last_call, audit.call_days, period)
     if cov:
         warnings.append(cov)

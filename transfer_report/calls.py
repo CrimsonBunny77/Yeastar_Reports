@@ -20,7 +20,7 @@ import pandas as pd
 
 from .errors import EmptyUploadError, InvalidFileError, MissingColumnsError, ReportError
 from .loader import DT_RE, parse_times
-from .mapping import normalise_extension
+from .mapping import department_at, department_extensions, moves_notice, normalise_extension
 from .overlap import file_label, find_overlaps, latest_first, overlap_warning
 
 ProgressFn = Callable[[float, str], None]
@@ -203,8 +203,26 @@ def parse_layers(name: str, data: bytes) -> tuple[pd.DataFrame, pd.DataFrame, in
 
 
 def read_calls_file(name: str, data: bytes, dept_exts: set[str], all_exts: set[str], dayfirst: bool,
-                    ext_dept: dict[str, str] | None = None) -> CallsFile:
+                    ext_dept: dict[str, str] | None = None, mapping: pd.DataFrame | None = None,
+                    department: str | None = None) -> CallsFile:
+    """Read one CDR file. With ``mapping`` (and ``department``, or ALL_DEPARTMENTS) each call is attributed to the
+    department its extension was in at the time of the call (outbound: the call time; inbound: the answering leg's
+    start); without it, ``dept_exts`` / ``ext_dept`` give a fixed extension -> department lookup."""
     ext_dept = ext_dept or {}
+    dated = mapping is not None
+
+    def dept_of(ext: pd.Series, when: pd.Series) -> pd.Series:  # department at that time (NaN = not mapped then)
+        return department_at(mapping, ext, when) if dated else ext.map(ext_dept)
+
+    def selected(ext: pd.Series, dept: pd.Series) -> pd.Series:  # rows that belong to the report's department
+        keep = ext.isin(dept_exts)
+        if dated:
+            keep = keep & (dept.notna() if department in (None, ALL_DEPARTMENTS) else dept == department)
+        return keep
+
+    def unmapped(ext: pd.Series, dept: pd.Series) -> pd.Series:
+        return dept.isna() if dated else ~ext.isin(all_exts)
+
     if not data:
         raise InvalidFileError(f"'{name}' is empty.")
     summ, legs, rows = parse_layers(name, data)
@@ -213,11 +231,12 @@ def read_calls_file(name: str, data: bytes, dept_exts: set[str], all_exts: set[s
     # ---------------- outbound: department extension dialled out
     ob_all = summ[ctype == "outbound"].copy()
     ob_all["ext"] = normalise_extension(ob_all["frm"].str.extract(EXT_RE, expand=False))
-    ob = ob_all[ob_all["ext"].isin(dept_exts)]
+    ob_all["dept"] = dept_of(ob_all["ext"], parse_times(ob_all["c2"], dayfirst))
+    ob = ob_all[selected(ob_all["ext"], ob_all["dept"])]
     outbound = pd.DataFrame({
         "Date/Time": parse_times(ob["c2"], dayfirst),
         "Direction": "Outbound",
-        "Department": ob["ext"].map(ext_dept).fillna(""),
+        "Department": ob["dept"].fillna(""),
         "Extension": ob["ext"],
         "Agent": _agent(ob["frm"]),
         "Number": _clean_number(ob["to"]),
@@ -235,12 +254,13 @@ def read_calls_file(name: str, data: bytes, dept_exts: set[str], all_exts: set[s
     lg["agent"] = _agent(lg["to"])
     lg = lg[(_status(lg["status"]) == "ANSWERED") & lg["ext"].notna()]
     lg["talk_s"] = _seconds(lg["leg_talk"])
-    mine = lg[lg["ext"].isin(dept_exts)].copy()
+    lg["dept"] = dept_of(lg["ext"], parse_times(lg["c2"], dayfirst))
+    mine = lg[selected(lg["ext"], lg["dept"])].copy()
     # A queue/IVR leg overlaps in time with the agent leg that took the call, so talk time is summed over agent
     # legs when there are any, and over the system legs only when there are none.
     mine["sys"] = mine["agent"].str.lower().str.contains("|".join(SYSTEM_WORDS), regex=True)
     mine["talk_agent"] = mine["talk_s"].where(~mine["sys"], 0)
-    mine["dept"] = mine["ext"].map(ext_dept).fillna("")
+    mine["dept"] = mine["dept"].fillna("")
     g = mine.groupby("id", sort=False)
     agg = pd.DataFrame({
         "Extension": g["ext"].agg(_join_unique), "Agent": g["agent"].agg(_join_unique),
@@ -266,11 +286,11 @@ def read_calls_file(name: str, data: bytes, dept_exts: set[str], all_exts: set[s
 
     # ---------------- extensions on these calls that are not in the mapping (people, not IVRs/queues)
     seen = []
-    o = ob_all[~ob_all["ext"].isin(all_exts) & ob_all["ext"].notna()]
+    o = ob_all[unmapped(ob_all["ext"], ob_all["dept"]) & ob_all["ext"].notna()]
     if len(o):
         seen.append(pd.DataFrame({"Extension": o["ext"], "Name": _agent(o["frm"]), "Seen as": "Outbound caller",
                                   "Call ID": o["id"]}))
-    u = lg[~lg["ext"].isin(all_exts)]
+    u = lg[unmapped(lg["ext"], lg["dept"])]
     u = u[~u["agent"].str.lower().str.contains("|".join(SYSTEM_WORDS), regex=True)]
     if len(u):
         seen.append(pd.DataFrame({"Extension": u["ext"], "Name": u["agent"], "Seen as": "Inbound answered",
@@ -397,8 +417,9 @@ def process_calls(
     if not files:
         raise EmptyUploadError("No files were uploaded. Please upload at least one XLS/XLSX file.")
     all_mode = department == ALL_DEPARTMENTS
-    dept_exts = set(mapping["Extension"]) if all_mode else set(mapping.loc[mapping["Department"] == department, "Extension"])
-    ext_dept = dict(zip(mapping["Extension"], mapping["Department"]))
+    # Extensions that belong to the department at some point in the report month; each call is then attributed by
+    # the date it happened (see read_calls_file), so a mid-month move splits an extension's calls between departments.
+    dept_exts = set(mapping["Extension"]) if all_mode else department_extensions(mapping, department, period)
     if not dept_exts:
         raise ReportError(f"No extensions are mapped to '{department}' in the department mapping file.")
     all_exts = set(mapping["Extension"])
@@ -412,7 +433,7 @@ def process_calls(
     for i, (name, data) in enumerate(files):
         report(0.05 + 0.65 * i / n, f"Reading {name} ({i + 1}/{n})")
         try:
-            res = read_calls_file(name, data, dept_exts, all_exts, dayfirst, ext_dept)
+            res = read_calls_file(name, data, dept_exts, all_exts, dayfirst, mapping=mapping, department=department)
         except (InvalidFileError, MissingColumnsError) as exc:
             audit.files_failed.append((name, str(exc)))
             continue
@@ -464,7 +485,7 @@ def process_calls(
         dt = dt[(dt.dt.year >= 2000) & (dt.dt.year <= 2100)]
         period = dt.dt.to_period("M").mode().iloc[0] if len(dt) else pd.Timestamp.now().to_period("M")
 
-    warnings = []
+    warnings = moves_notice(mapping, period, None if all_mode else department)
     cov = coverage_warning(audit.first_call, audit.last_call, audit.call_days, period)
     if cov:
         warnings.append(cov)
