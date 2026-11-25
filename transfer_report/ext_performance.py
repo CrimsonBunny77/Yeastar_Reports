@@ -25,7 +25,7 @@ from .calls import EXT_RE, _agent, _status, coverage_info, coverage_warning, hms
 from .errors import EmptyUploadError, InvalidFileError, MissingColumnsError, ReportError
 from .ext_stats import NON_EXTENSION_WORDS, ExtAudit, _ext_sort_key
 from .loader import parse_times
-from .mapping import normalise_extension
+from .mapping import department_at, department_extensions, moves_notice, normalise_extension
 from .overlap import file_label, find_overlaps, latest_first, overlap_warning
 
 ProgressFn = Callable[[float, str], None]
@@ -134,7 +134,9 @@ def process_ext_performance(
     files = list(files)
     if not files:
         raise EmptyUploadError("No files were uploaded. Please upload at least one XLS/XLSX file.")
-    extensions = sorted(set(mapping.loc[mapping["Department"] == department, "Extension"]), key=_ext_sort_key)
+    # Extensions that belong to the department at some point in the report month; a leg only counts if its extension
+    # was in the department on the date of the leg (a mid-month move splits the extension's legs by date).
+    extensions = sorted(department_extensions(mapping, department, period), key=_ext_sort_key)
     if not extensions:
         raise ReportError(f"No extensions are mapped to '{department}' in the department mapping file.")
     dept_exts = set(extensions)
@@ -173,6 +175,7 @@ def process_ext_performance(
         before = len(legs)
         legs = legs.drop_duplicates(["ID", "Leg", "Extension"])
         audit.duplicates_removed = before - len(legs)
+    legs = legs[department_at(mapping, legs["Extension"], legs["Time"]) == department]  # in dept on that date
     if period is not None:  # the report covers the selected month only
         inside = (legs["Time"] >= period.start_time) & (legs["Time"] <= period.end_time)
         audit.outside_period = int((~inside).sum())
@@ -197,7 +200,7 @@ def process_ext_performance(
 
     if period is None:
         period = pd.Timestamp.now().to_period("M")
-    warnings = []
+    warnings = moves_notice(mapping, period, department)
     cov = coverage_warning(audit.first_call, audit.last_call, audit.call_days, period)
     if cov:
         warnings.append(cov)

@@ -10,9 +10,9 @@ import pandas as pd
 from .config import COUNT_COLUMNS, METRIC_COLUMNS, NOT_COMPLETED, STATUS_FLAGS, STATUS_LABELS
 from .errors import EmptyUploadError, InvalidFileError, MissingColumnsError, NoTransfersError, ReportError
 from .calls import coverage_warning, merge_days
-from .loader import NO_LEG, read_cdr_file
+from .loader import NO_LEG, parse_times, read_cdr_file
 from .overlap import file_label, find_overlaps, latest_first, overlap_warning
-from .mapping import normalise_extension
+from .mapping import department_at, moves_notice, normalise_extension
 
 ProgressFn = Callable[[float, str], None]
 MATCH_BOTH, MATCH_EITHER = "both", "either"
@@ -191,11 +191,13 @@ def process_files(
             audit.unmatched_status = int((data["Last Status"] == NO_LEG).sum())
 
     report(0.78, "Mapping departments")
-    lookup = dict(zip(mapping["Extension"], mapping["Department"]))
     data["TransferFrom"] = normalise_extension(data["TransferFrom"])
     data["TransferTo"] = normalise_extension(data["TransferTo"])
-    data["From Department"] = data["TransferFrom"].map(lookup)
-    data["To Department"] = data["TransferTo"].map(lookup)
+    # Each side is mapped to the department its extension was in at the time of the transfer, so an extension
+    # that moved department part-way through the month is attributed correctly on both sides of the move.
+    when = parse_times(data["Time"], dayfirst)
+    data["From Department"] = department_at(mapping, data["TransferFrom"], when)
+    data["To Department"] = department_at(mapping, data["TransferTo"], when)
 
     unmapped_summary, unmapped_records = summarise_unmapped(data)
     mapped = data.dropna(subset=["From Department", "To Department"])
@@ -242,6 +244,7 @@ def process_files(
     detail = compute_metrics(external)
 
     warnings = [month_warning] if month_warning else []
+    warnings += moves_notice(mapping, period)
     cov = coverage_warning(audit.first_call, audit.last_call, audit.call_days, period)
     if cov:
         warnings.append(cov)

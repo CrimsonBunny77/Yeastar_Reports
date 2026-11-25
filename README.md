@@ -56,6 +56,34 @@ placeholders. Replace them with your real extensions.** Format the Extension col
 text so leading zeros (e.g. `031`) are kept. Add or rename departments freely; no code changes
 are required. You can also upload a different mapping file from the sidebar.
 
+### When an extension moves department part-way through a month
+
+The mapping has an optional third column, **`Effective From`** (a date such as `2026-10-22`; blank means "from the
+beginning"). To record a move, **keep the old row and add a new row** for the same extension with the new
+department and the first day it applies. A row applies until the next row for that extension starts, so there is no
+end-date column.
+
+| Extension | Department    | Effective From |
+|-----------|---------------|----------------|
+| 078       | Customer Care |                |
+| 078       | Complaints    | 2026-10-22     |
+
+Every report then attributes a call to the department the extension was in **on the date of that call** (the change
+takes effect at 00:00 on the effective date):
+
+* **Transfer report** - each side of a transfer is mapped at the transfer time, so a transfer from ext 078 to
+  Customer Care is a same-department transfer (excluded) before 22 Oct and a Complaints -> Customer Care transfer
+  from 22 Oct.
+* **Department call list / Extension call stats / Extension performance detail** - the extension appears under both
+  departments, each with only the calls from the dates it belonged there. An extension is not listed for a
+  department it left before the report month started.
+* Each report shows a notice naming the department changes that fall inside the report month.
+* Calls from before an extension's first *dated* row are treated as unmapped, so give an extension's first row a
+  blank date unless it really did not exist before that date.
+* Two rows for the same extension with the same date (or both blank) are reported as a warning and the first is used.
+  A value in the column that is not a date stops the load with a message naming the row.
+* A mapping with no `Effective From` values behaves exactly as before.
+
 ## Department call list (second report type)
 
 Choose **Department call list** at the top of the page, upload the same CDR files, pick a department and click
