@@ -248,3 +248,20 @@ def test_existing_reports_are_unchanged_on_the_same_file():
     assert len(read_perf_file(*file, {"010", "074"}).legs) == 3
     calls = read_calls_file(file[0], file[1], {"010", "074"}, {"010", "074"}, dayfirst=True)
     assert len(calls.outbound) == 1 and calls.inbound.empty  # nobody answered the inbound call
+
+
+def test_extension_stats_split_inbound_outbound_by_the_leg_type_like_the_pbx():
+    # 074 dials out (Outbound leg); the call is then transferred to 010, who does not answer, so 010's own
+    # voicemail box takes it. Both of 010's legs are Inbound legs on a call whose summary type is Outbound.
+    call = ("Outbound", "X1", "01/09/2026 10:00:00", [
+        leg("X1", "1", "01/09/2026 10:00:00", "Outbound", "Itumeleng Lehasa<074>", "0829999999", "ANSWERED"),
+        leg("X1", "2", "01/09/2026 10:01:00", "Inbound", "0829999999", "Angelina Ramoroa<010>", "NO ANSWER"),
+        leg("X1", "3", "01/09/2026 10:01:30", "Inbound", "0829999999", "Voicemail Angelina Ramoroa<010>", "VOICEMAIL"),
+    ])
+    res = process_ext_stats([cdr(call)], MAPPING, NAMES, "Claims Call Centre", period=PERIOD)
+    ib = res.tables["Inbound"].set_index("Extension")
+    ob = res.tables["Outbound"].set_index("Extension")
+    assert (ib.loc["010", "Total Calls"], ib.loc["010", "No Answer"], ib.loc["010", "Voicemail"]) == (2, 1, 1)
+    assert ob.loc["010", "Total Calls"] == 0 and ib.loc["074", "Total Calls"] == 0
+    assert (ob.loc["074", "Total Calls"], ob.loc["074", "Answered"]) == (1, 1)
+    assert res.all_calls.set_index("Extension").loc["010", "Total Calls"] == 2  # the total is unchanged
