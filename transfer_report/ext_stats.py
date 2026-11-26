@@ -3,7 +3,8 @@
 For every extension of the selected department: Total Calls, Answered, No Answer, Busy, Voicemail, Abandoned,
 Transfers Not Completed and Answer %. The counting rule mirrors the PBX's own "Extension Call Statistics" report: every call leg the
 extension was on, as caller or as callee, counts once under that leg's own status (including the extension's own
-voicemail-box leg). Inbound / Outbound / Internal is the type of the call the leg belongs to.
+voicemail-box leg). Inbound / Outbound / Internal is the leg's OWN communication type, as in the PBX report (so a
+transferred-in or voicemail leg on a call that was dialled out counts as Inbound for the extension that received it).
 
 Uses the same layered Yeastar export as the other reports (see calls.parse_layers).
 """
@@ -62,13 +63,14 @@ def read_ext_file(name: str, data: bytes, dept_exts: set[str], include_internal:
     """One event per call leg the department's extensions were on, as caller (From) or callee (To).
 
     This is how the PBX's own "Extension Call Statistics" report counts: a leg's outcome is that leg's Status,
-    including the extension's own voicemail-box leg ("Voicemail <name><ext>"). Direction is the type of the call the
-    leg belongs to (Inbound / Outbound / Internal). Queue, IVR and ring-group legs are not extensions and are ignored.
+    including the extension's own voicemail-box leg ("Voicemail <name><ext>"). Direction is the leg's own
+    Communication Type (Inbound / Outbound / Internal), falling back to the call's type only if a leg has none. Queue, IVR and ring-group legs are not extensions and are ignored.
     """
     summ, legs, rows = parse_layers(name, data)
     call_type = summ.drop_duplicates("id").set_index("id")["type"].fillna("").str.strip().str.lower()
     lg = legs.copy()
-    lg["ctype"] = lg["id"].map(call_type)
+    leg_type = lg["ltype"].fillna("").str.strip().str.lower()
+    lg["ctype"] = leg_type.where(leg_type != "", lg["id"].map(call_type).fillna(""))
     call_time = pd.Series(parse_times(summ["c2"], dayfirst).values, index=summ["id"].values)
     call_time = call_time[~call_time.index.duplicated()]
     lg["Time"] = lg["id"].map(call_time)

@@ -120,7 +120,9 @@ Voicemail, Abandoned, Transfers Not Completed and Answer % (Answered / Total Cal
   as caller or as callee, counts once under that leg's own status, including the extension's own voicemail-box leg
   ("Voicemail <name><ext>"). Queue, IVR and ring-group legs are not extensions and are ignored. Checked against a PBX
   report: an extension with complete data matched on every column.
-* **Inbound / Outbound / Internal** tables = the type of the call the leg belongs to. *Include internal calls* is on
+* **Inbound / Outbound / Internal** tables = the leg's own Communication Type, exactly as the PBX report does it (a
+  call that was dialled out and then transferred to a colleague, or to a voicemail box, is Inbound for the extension
+  that received it). *Include internal calls* is on
   by default because the PBX's "All" includes them.
 * **Only calls inside the selected report month are counted.** If some days of the month have no calls at all
   (an incomplete export), a warning names the missing days, because the totals will then be lower than a PBX report

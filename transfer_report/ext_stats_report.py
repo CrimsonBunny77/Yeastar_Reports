@@ -22,10 +22,10 @@ NOTES = {
     "All calls": "Every call leg the extension was on, as caller or callee (inbound + outbound{internal}), counted by "
                  "that leg's status - the same counting as the PBX's Extension Call Statistics report. "
                  "Answer % = Answered / Total Calls.",
-    "Inbound": "Legs on inbound calls (calls from outside, including when transferred). A call that rings several "
-               "extensions counts once for each.",
-    "Outbound": "Legs on outbound calls (calls dialled out, including transfers made during them).",
-    "Internal": "Legs on internal calls between extensions.",
+    "Inbound": "Inbound legs (calls received from outside, including calls transferred to the extension and its voicemail "
+               "box), by each leg's own type as in the PBX report. A call that rings several extensions counts once for each.",
+    "Outbound": "Outbound legs (calls the extension dialled out), by each leg's own type as in the PBX report.",
+    "Internal": "Internal legs between extensions, by each leg's own type.",
 }
 
 
