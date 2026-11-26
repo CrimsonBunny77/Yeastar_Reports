@@ -21,7 +21,10 @@ from transfer_report.ext_performance_report import (DEFAULT_TITLE as PERF_TITLE,
 from transfer_report.ext_stats import process_ext_stats
 from transfer_report.ext_stats_report import (DEFAULT_TITLE as EXT_TITLE, build_ext_stats_pdf,
                                               build_ext_stats_xlsx, ext_filename)
-from transfer_report.config import DEFAULT_CDR_DIR, DEFAULT_MAPPING_PATH, DEFAULT_QUEUE_MAPPING_PATH
+from transfer_report.config import (DEFAULT_CDR_DIR, DEFAULT_EXCLUDED_DAYS_PATH, DEFAULT_MAPPING_PATH,
+                                    DEFAULT_QUEUE_MAPPING_PATH)
+from transfer_report.hours import (CLOSED, DAY_TYPES, DEFAULT_END, DEFAULT_START, build_office_hours, days_for_year,
+                                   load_days, save_days)
 from transfer_report.errors import MappingError, ReportError
 from transfer_report.exports import unmapped_to_xlsx
 from transfer_report.mapping import create_template, list_departments, load_mapping
@@ -164,6 +167,51 @@ with st.sidebar:
             step=1, help="Matches the PBX's 'exclude calls within X seconds' settings (1 by default). "
                          "Excluded visits are listed on the Exceptions tab."))
 
+    # Office hours (Extension call stats and Queue overflow only)
+    office_hours = None
+    if EXT_STATS or QUEUE:
+        st.divider()
+        st.subheader("Office hours")
+        apply_hours = st.checkbox(
+            "Exclude after-hours, weekends and excluded days", value=True, key="apply_hours",
+            help="When ticked, the report's tables count only calls that started during office hours. Calls after "
+                 "hours, on weekends and on the excluded days below are still shown, in a separate section. "
+                 "Untick to count every call, like the PBX's own reports.")
+        h1, h2 = st.columns(2)
+        open_at = h1.time_input("Opens", value=DEFAULT_START, step=timedelta(minutes=15), key="hours_open",
+                                disabled=not apply_hours)
+        close_at = h2.time_input("Closes", value=DEFAULT_END, step=timedelta(minutes=15), key="hours_close",
+                                 disabled=not apply_hours, help="A call at this time or later is after hours.")
+        days_year = int(st.session_state.get("report_year") or (date.today().replace(day=1) - timedelta(days=1)).year)
+        base_key = f"days_base_{days_year}"
+        if base_key not in st.session_state:  # kept for the session so edits are never applied twice
+            st.session_state[base_key] = days_for_year(days_year, load_days(DEFAULT_EXCLUDED_DAYS_PATH))
+        with st.expander(f"Excluded and short days ({days_year})", expanded=False):
+            st.caption("Pre-filled with South Africa's public holidays for the report year, or with the days you "
+                       "saved. Add rows for once-off closures. For a short day choose 'Short day' and enter the "
+                       "closing time; calls after it count as after hours.")
+            days = st.data_editor(
+                st.session_state[base_key], num_rows="dynamic", hide_index=True, key=f"days_editor_{days_year}",
+                disabled=not apply_hours, use_container_width=True,
+                column_config={
+                    "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY", required=True),
+                    "Type": st.column_config.SelectboxColumn("Type", options=DAY_TYPES, default=CLOSED, required=True),
+                    "Closes At": st.column_config.TimeColumn("Closes at", format="HH:mm",
+                                                             help="Short days only: the early closing time."),
+                    "Reason": st.column_config.TextColumn("Reason"),
+                })
+            if st.button("Save these days for next time", disabled=not apply_hours, key="save_days",
+                         help=f"Saves the list for {days_year} to excluded_days.xlsx next to app.py."):
+                try:
+                    save_days(DEFAULT_EXCLUDED_DAYS_PATH, days_year, days)
+                    st.success(f"Saved the excluded and short days for {days_year}.")
+                except OSError as exc:
+                    st.error(f"Could not save excluded_days.xlsx: {exc}")
+        if apply_hours:
+            office_hours, hours_warnings = build_office_hours(days, open_at, close_at)
+            for w in hours_warnings:
+                st.warning(w)
+
 # ---------------------------------------------------------------- upload
 files = st.file_uploader("Drag and drop Yeastar CDR files here", type=["xls", "xlsx"],
                          accept_multiple_files=True)
@@ -190,7 +238,7 @@ report_title = c1.text_input("Report name", value={REPORT_TYPES[0]: "Yeastar Tra
                              help="Shown on the cover page and used in the file names.").strip()
 month_names = list(calendar.month_name)[1:]
 month_name = c2.selectbox("Report month", month_names, index=None, placeholder="Please Select Month")
-year = int(c3.number_input("Year", min_value=2000, max_value=2100, value=prev_month.year, step=1))
+year = int(c3.number_input("Year", min_value=2000, max_value=2100, value=prev_month.year, step=1, key="report_year"))
 # The month is mandatory: no report can be generated until one is chosen.
 period = pd.Period(year=year, month=month_names.index(month_name) + 1, freq="M") if month_name else None
 if period is None:
@@ -415,7 +463,7 @@ def render_ext_stats():
             res = process_ext_stats(
                 payload, mapping, names, department, include_internal=include_internal, hide_idle=hide_idle,
                 dedupe=dedupe, period=period, dayfirst=date_order.startswith("Day"),
-                progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg),
+                progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg), office_hours=office_hours,
             )
             bar.progress(0.93, text="Building PDF and Excel…")
             title = report_title or EXT_TITLE
@@ -464,10 +512,23 @@ def render_ext_stats():
     c[1].metric("Total calls", f"{int(t['Total Calls']):,}")
     c[2].metric("Answered", f"{int(t['Answered']):,}")
     c[3].metric("Answer %", f"{(t['Answered'] / t['Total Calls'] * 100 if t['Total Calls'] else 0):.1f}")
-    tabs = dict(zip(res.tables, st.tabs(list(res.tables))))
+    names_ = list(res.tables)
+    if res.office_hours:
+        out_total = int(res.outside["Total Calls"].iloc[-1])
+        st.info(f"**Office hours only.** {out_total:,} call leg(s) outside office hours are counted separately on "
+                f"the 'Outside office hours' tab. {res.hours_note}")
+        names_.append("Outside office hours")
+    tabs = dict(zip(names_, st.tabs(names_)))
     for name, df in res.tables.items():
         with tabs[name]:
             st.dataframe(df, use_container_width=True, hide_index=True)
+    if res.office_hours:
+        with tabs["Outside office hours"]:
+            st.dataframe(res.outside, use_container_width=True, hide_index=True)
+            st.caption("Not included in the other tabs. A call is counted once: excluded day first, then weekend, "
+                       "then after hours.")
+            st.markdown("**By extension** (after hours, weekends and excluded days together)")
+            st.dataframe(res.outside_by_extension, use_container_width=True, hide_index=True)
 
 
 # ================================================================ queue overflow report
@@ -484,7 +545,7 @@ def render_queue_overflow():
             res = process_queue_overflow(
                 payload, queue_map, selected_queues, queue_issues, dayfirst=date_order.startswith("Day"),
                 dedupe=dedupe, period=period, progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg),
-                min_ring_s=min_ring_s,
+                min_ring_s=min_ring_s, office_hours=office_hours,
             )
             bar.progress(0.93, text="Building PDF and Excel…")
             title = report_title or QUEUE_TITLE
@@ -540,12 +601,29 @@ def render_queue_overflow():
                f"recorded agent answer · {s['Entered by automatic overflow']:,} entered by automatic overflow · "
                f"{s['Entered by manual transfer']:,} by manual transfer · {s['Routing undetermined']:,} with an "
                f"undetermined routing type · {s['Exceptions to review']:,} exceptions to review")
+    if res.office_hours:
+        st.info(f"**Office hours only.** {len(res.outside_detail):,} queue visit(s) outside office hours are counted "
+                f"separately on the 'Outside office hours' tab. {res.hours_note}")
 
     with st.expander("Definitions used in this report", expanded=True):
         for term, text in res.definitions:
             st.markdown(f"**{term}:** {text}")
 
-    tabs = st.tabs(["Summary by queue", "Routing type", "Call detail", f"Exceptions ({len(res.exceptions):,})"])
+    tab_names = ["Summary by queue", "Routing type", "Call detail", f"Exceptions ({len(res.exceptions):,})"]
+    if res.office_hours:
+        tab_names.insert(3, f"Outside office hours ({len(res.outside_detail):,})")
+    tabs = st.tabs(tab_names)
+    if res.office_hours:
+        with tabs[3]:
+            st.dataframe(res.outside, use_container_width=True, hide_index=True)
+            st.caption("Queue visits that entered the queue outside office hours. They are not included in the other "
+                       "tabs. A visit is counted once: excluded day first, then weekend, then after hours.")
+            st.markdown("**By queue**")
+            st.dataframe(res.outside_summary, use_container_width=True, hide_index=True,
+                         column_config={c: st.column_config.NumberColumn(c, format="%.2f%%") for c in PERCENT_COLS})
+            st.markdown("**Detail** (one row per queue visit)")
+            st.dataframe(res.outside_detail[QUEUE_DETAIL_COLS], use_container_width=True, hide_index=True)
+        tabs = tabs[:3] + tabs[4:]  # the remaining code addresses the exceptions tab as tabs[3]
     with tabs[0]:
         st.dataframe(res.summary, use_container_width=True, hide_index=True,
                      column_config={c: st.column_config.NumberColumn(c, format="%.2f%%") for c in PERCENT_COLS})
@@ -561,7 +639,11 @@ def render_queue_overflow():
                    "automatic overflow.")
     with tabs[2]:
         detail = res.detail
-        first_day, last_day = detail["Time"].min().date(), detail["Time"].max().date()
+        if detail.empty:
+            st.info("No queue visits inside office hours.")
+            first_day = last_day = res.period.start_time.date()
+        else:
+            first_day, last_day = detail["Time"].min().date(), detail["Time"].max().date()
         queue_labels = {n: queue_label(n, nm) for n, nm in zip(res.queues["Queue Number"], res.queues["Queue Name"])}
         f1, f2, f3, f4 = st.columns(4)
         day_range = f1.date_input("Date entered queue", value=(first_day, last_day), min_value=first_day, max_value=last_day,

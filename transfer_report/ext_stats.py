@@ -21,6 +21,7 @@ from .loader import parse_times
 from .overlap import file_label, find_overlaps, latest_first, overlap_warning
 from .config import NOT_COMPLETED
 from .errors import EmptyUploadError, InvalidFileError, MissingColumnsError, ReportError
+from .hours import OFFICE, OUTSIDE, OfficeHours
 from .mapping import department_at, department_extensions, moves_notice, normalise_extension
 
 ProgressFn = Callable[[float, str], None]
@@ -114,6 +115,24 @@ def total_row(table: pd.DataFrame) -> dict:
     return t
 
 
+OUTSIDE_COLS = ["Period", "Total Calls"] + OUTCOMES + ["Answer %"]
+
+
+def outside_table(events: pd.DataFrame) -> pd.DataFrame:
+    """Calls outside office hours by group (After hours, Weekend, Excluded day) and a total row."""
+    rows = []
+    for label in OUTSIDE:
+        sub = events[events["Period"] == label]
+        vc = sub["Outcome"].value_counts()
+        rows.append({"Period": label, "Total Calls": len(sub), **{c: int(vc.get(c, 0)) for c in OUTCOMES}})
+    out = pd.DataFrame(rows, columns=OUTSIDE_COLS[:-1])
+    out = pd.concat([out, pd.DataFrame([{"Period": "Total outside office hours",
+                                         **out.drop(columns="Period").sum().to_dict()}])], ignore_index=True)
+    out[OUTSIDE_COLS[1:-1]] = out[OUTSIDE_COLS[1:-1]].astype(int)
+    out["Answer %"] = (out["Answered"] / out["Total Calls"].where(out["Total Calls"] > 0) * 100).round(1).fillna(0.0)
+    return out[OUTSIDE_COLS]
+
+
 @dataclass
 class ExtAudit:
     files_processed: int = 0
@@ -139,10 +158,19 @@ class ExtStatsResult:
     period: pd.Period
     include_internal: bool
     warnings: list[str] = field(default_factory=list)
+    # Set only when office hours were applied: the rules used, calls outside office hours by group, and the same
+    # calls by extension. The main tables then count office-hours calls only.
+    office_hours: OfficeHours | None = None
+    outside: pd.DataFrame | None = None
+    outside_by_extension: pd.DataFrame | None = None
 
     @property
     def all_calls(self) -> pd.DataFrame:
         return self.tables["All calls"]
+
+    @property
+    def hours_note(self) -> str:
+        return self.office_hours.describe(self.period) if self.office_hours else ""
 
 
 def process_ext_stats(
@@ -156,7 +184,10 @@ def process_ext_stats(
     period: pd.Period | None = None,
     dayfirst: bool = True,
     progress: ProgressFn | None = None,
+    office_hours: OfficeHours | None = None,
 ) -> ExtStatsResult:
+    """office_hours: when given, the main tables count only call legs whose call started inside office hours;
+    legs after hours, on weekends and on excluded days are counted separately (result.outside)."""
     files = list(files)
     if not files:
         raise EmptyUploadError("No files were uploaded. Please upload at least one XLS/XLSX file.")
@@ -222,15 +253,28 @@ def process_ext_stats(
                  .agg(lambda s: s.value_counts().index[0]).to_dict())
     full_names = {e: (lookup.get(e) or cdr_names.get(e, "")) for e in extensions}
 
+    outside = outside_by_ext = None
+    if office_hours is not None:  # split by the time the call started
+        events = events.assign(Period=office_hours.classify(events["Time"]))
+        out_events = events[events["Period"] != OFFICE]
+        outside = outside_table(out_events)
+        outside_by_ext = stats_table(out_events, extensions, full_names)
+        events = events[events["Period"] == OFFICE]
+
     subsets = {"All calls": events, "Inbound": events[events["Direction"] == "Inbound"],
                "Outbound": events[events["Direction"] == "Outbound"]}
     if include_internal:
         subsets["Internal"] = events[events["Direction"] == "Internal"]
     tables = {k: stats_table(v, extensions, full_names) for k, v in subsets.items()}
     shown = extensions
-    if hide_idle:
-        shown = [e for e in extensions if tables["All calls"].set_index("Extension").loc[e, "Total Calls"] > 0]
+    if hide_idle:  # an extension with calls only outside office hours is still shown
+        busy = tables["All calls"].set_index("Extension")["Total Calls"]
+        if outside_by_ext is not None:
+            busy = busy + outside_by_ext.set_index("Extension")["Total Calls"]
+        shown = [e for e in extensions if busy.loc[e] > 0]
         tables = {k: v[v["Extension"].isin(shown)].reset_index(drop=True) for k, v in tables.items()}
+        if outside_by_ext is not None:
+            outside_by_ext = outside_by_ext[outside_by_ext["Extension"].isin(shown)].reset_index(drop=True)
 
     if period is None:
         period = pd.Timestamp.now().to_period("M")
@@ -248,4 +292,5 @@ def process_ext_stats(
         warnings.append(f"{len(missing)} extension(s) have no name in the names file or the CDR: " + ", ".join(missing[:15])
                         + (" ..." if len(missing) > 15 else ""))
     return ExtStatsResult(department=department, extensions=shown, tables=tables, audit=audit, period=period,
-                          include_internal=include_internal, warnings=warnings)
+                          include_internal=include_internal, warnings=warnings, office_hours=office_hours,
+                          outside=outside, outside_by_extension=outside_by_ext)

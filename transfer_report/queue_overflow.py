@@ -40,6 +40,7 @@ import pandas as pd
 from .calls import (EXT_RE, MAX_COLS, SYSTEM_WORDS, _agent, _clean_number, _read, _status, coverage_info,
                     coverage_warning, merge_days)
 from .errors import EmptyUploadError, InvalidFileError, MissingColumnsError, ReportError
+from .hours import OFFICE, OUTSIDE, OfficeHours
 from .loader import DT_RE, parse_times
 from .mapping import normalise_extension
 from .overlap import file_label, find_overlaps, latest_first, overlap_warning
@@ -74,7 +75,8 @@ ROUTING_COLS = ["Queue Number", "Queue", "Unique Calls", "Visits"] + ROUTING_TYP
 DETAIL_COLS = ["Call ID", "Time", "Caller", "Agent", "Status", "Ring Duration", "Talk Duration", "Hold Duration",
                "Queue Number", "Queue", "Call Type", "Call Time", "Visit #", "Queue Path", "Previous Queue",
                "Routing Type", "Routing Note", "Final Status", "Answered by Queue Agent", "Overflowed To",
-               "Source File"]
+               "Office Hours", "Source File"]
+OUTSIDE_COLS = ["Period", "Total Calls"] + VISIT_COLS + ["Unique Calls"]
 EXCEPTION_COLS = ["Type", "Queue Number", "Queue", "Call ID", "Call Time", "Detail", "Source File"]
 
 # Header names the reader needs. The summary, leg and event blocks each have their own header row and Yeastar
@@ -84,12 +86,20 @@ LEG_DEFAULTS = {"Call To": 5, "Status": 6, "Call Duration": 7, "Ring Duration": 
 EVENT_DEFAULTS = {"Event": 4, "Event Start Time": 5}
 
 
-def definitions(period: pd.Period | None = None, min_ring_s: int = MIN_RING_S) -> list[tuple[str, str]]:
+def definitions(period: pd.Period | None = None, min_ring_s: int = MIN_RING_S,
+                office_hours: OfficeHours | None = None) -> list[tuple[str, str]]:
     """The wording shown in the app, the PDF and the Excel workbook (one source so they always agree)."""
     month = period.strftime("%B %Y") if period is not None else "the selected month"
+    hours = ([("Office hours", "Only queue visits that entered the queue during office hours are counted in the "
+                               "summary, routing and final-status tables. Visits after hours, on weekends and on "
+                               "excluded days are counted separately in the Outside office hours tables (a visit is "
+                               "counted once: excluded day first, then weekend, then after hours). "
+                               + office_hours.describe(period))]
+             if office_hours else [])
     return [
         ("Report period", f"Queue visits whose entry time (the Time column) falls in {month}, the month selected "
                           "before generating. Visits outside it are left out and counted on the audit page."),
+        *hours,
         ("Total calls", "Queue visits: every time a call entered the queue, as the PBX's own Queue Performance "
                         "report counts them. A call that rings the queue, times out and comes back is counted each "
                         "time. All call types are included (inbound, internal and outbound calls that reach the "
@@ -164,6 +174,12 @@ class QueueResult:
     warnings: list[str] = field(default_factory=list)
     final: pd.DataFrame = field(default_factory=pd.DataFrame)  # unique calls by final status
     min_ring_s: int = MIN_RING_S
+    # Set only when office hours were applied. detail and the tables above then hold office-hours visits only;
+    # outside_detail holds the rest, outside the breakdown by group, outside_summary the same by queue.
+    office_hours: OfficeHours | None = None
+    outside_detail: pd.DataFrame | None = None
+    outside: pd.DataFrame | None = None
+    outside_summary: pd.DataFrame | None = None
 
     @property
     def stats(self) -> dict:
@@ -184,11 +200,27 @@ class QueueResult:
             "Entered by manual transfer": calls_where(d["Routing Type"] == MANUAL),
             "Routing undetermined": calls_where(d["Routing Type"] == UNDETERMINED),
             "Exceptions to review": len(self.exceptions),
+            **({"Outside office hours (queue visits)": len(self.outside_detail)} if self.office_hours else {}),
         }
 
     @property
     def definitions(self) -> list[tuple[str, str]]:
-        return definitions(self.period, self.min_ring_s)
+        return definitions(self.period, self.min_ring_s, self.office_hours)
+
+    @property
+    def hours_note(self) -> str:
+        return self.office_hours.describe(self.period) if self.office_hours else ""
+
+
+def outside_table(visits: pd.DataFrame) -> pd.DataFrame:
+    """Queue visits outside office hours by group, with how each visit ended, and a total row."""
+    rows = []
+    for label, sub in [(p, visits[visits["Office Hours"] == p]) for p in OUTSIDE] + [
+            ("Total outside office hours", visits)]:
+        vc = sub["Status"].value_counts()
+        rows.append({"Period": label, "Total Calls": len(sub), **{c: int(vc.get(c, 0)) for c in VISIT_COLS},
+                     "Unique Calls": int(sub["_ckey"].nunique())})
+    return pd.DataFrame(rows, columns=OUTSIDE_COLS)
 
 
 # ------------------------------------------------------------------ small helpers
@@ -561,7 +593,10 @@ def process_queue_overflow(
     period: pd.Period | None = None,
     progress: ProgressFn | None = None,
     min_ring_s: int = MIN_RING_S,
+    office_hours: OfficeHours | None = None,
 ) -> QueueResult:
+    """office_hours: when given, the tables count only queue visits that entered the queue inside office hours;
+    visits after hours, on weekends and on excluded days are counted separately (result.outside)."""
     files = list(files)
     if not files:
         raise EmptyUploadError("No CDR files were uploaded. Upload at least one .xls / .xlsx file.")
@@ -716,9 +751,19 @@ def process_queue_overflow(
 
     if progress:
         progress(0.9, "Summarising…")
-    summary, routing, final = _summarise(sel, queues, names)
     sel["Position"] = sel["Position"].astype(int)
-    detail = sel[DETAIL_COLS + ["_ckey", "Position", "Next Routing Type"]]
+    # ---- office hours: by the time the call entered the queue
+    sel["Office Hours"] = office_hours.classify(sel["Time"]) if office_hours is not None else OFFICE
+    out_sel = sel[sel["Office Hours"] != OFFICE].reset_index(drop=True)
+    sel = sel[sel["Office Hours"] == OFFICE].reset_index(drop=True)
+    summary, routing, final = _summarise(sel, queues, names)
+    keep_cols = DETAIL_COLS + ["_ckey", "Position", "Next Routing Type"]
+    detail = sel[keep_cols]
+    outside = outside_summary = outside_detail = None
+    if office_hours is not None:
+        outside_detail = out_sel[keep_cols].reset_index(drop=True)
+        outside = outside_table(out_sel)
+        outside_summary = _summarise(out_sel, queues, names)[0]
 
     warnings: list[str] = []
     cov = coverage_warning(audit.first_call, audit.last_call, audit.call_days, period)
@@ -740,7 +785,7 @@ def process_queue_overflow(
     if progress:
         progress(0.93, "Done reading.")
     return QueueResult(period, queues, summary, routing, detail.reset_index(drop=True), exceptions, audit, warnings,
-                       final, min_ring_s)
+                       final, min_ring_s, office_hours, outside_detail, outside, outside_summary)
 
 
 # ------------------------------------------------------------------ filtering (used by the app's detail table)

@@ -12,7 +12,7 @@ from reportlab.platypus import CondPageBreak, PageBreak, Paragraph, SimpleDocTem
 
 from .calls_report import _trim, safe_filename
 from .config import NOT_COMPLETED
-from .ext_stats import TABLE_COLS, ExtStatsResult, total_row
+from .ext_stats import OUTSIDE_COLS, TABLE_COLS, ExtStatsResult, total_row
 from .overlap import overlap_note
 from .pdf_report import H1, H2, LIGHT, NAVY, NOTE, PAGE, SUB, TITLE, _logo_flowable, _make_footer
 
@@ -40,7 +40,22 @@ def _table(df: pd.DataFrame) -> Table:
     rows.append(["TOTAL", "", f"{t['Total Calls']:,}"] + [f"{t[c]:,}" for c in
                 ["Answered", "No Answer", "Busy", "Voicemail", "Abandoned", NOT_COMPLETED]] + [f"{t['Answer %']:.1f}"])
     tbl = Table([[c.replace(NOT_COMPLETED, "Transfers\nNot\nCompleted") for c in TABLE_COLS]] + rows, colWidths=WIDTHS, repeatRows=1)
-    tbl.setStyle(TableStyle([
+    tbl.setStyle(_style())
+    return tbl
+
+
+def _outside_table(df: pd.DataFrame) -> Table:
+    """Calls outside office hours by group; the last row of df is already the total."""
+    rows = [[r["Period"]] + [f"{r[c]:,}" for c in OUTSIDE_COLS[1:-1]] + [f"{r['Answer %']:.1f}"]
+            for r in df.to_dict("records")]
+    head = [c.replace(NOT_COMPLETED, "Transfers\nNot\nCompleted") for c in OUTSIDE_COLS]
+    tbl = Table([head] + rows, colWidths=[WIDTHS[0] + WIDTHS[1]] + WIDTHS[2:], repeatRows=1)
+    tbl.setStyle(_style())
+    return tbl
+
+
+def _style() -> TableStyle:
+    return TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), NAVY), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 8.5),
         ("ALIGN", (2, 0), (-1, -1), "RIGHT"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -49,8 +64,7 @@ def _table(df: pd.DataFrame) -> Table:
         ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#D6EAE6")),
         ("LINEABOVE", (0, -1), (-1, -1), 0.8, NAVY),
-    ]))
-    return tbl
+    ])
 
 
 def build_ext_stats_pdf(res: ExtStatsResult, title: str = DEFAULT_TITLE, logo: bytes | None = None,
@@ -65,13 +79,28 @@ def build_ext_stats_pdf(res: ExtStatsResult, title: str = DEFAULT_TITLE, logo: b
     story += [Paragraph(escape(title), TITLE), Spacer(1, 1 * cm),
               Paragraph(f"<b>Department:</b> {escape(res.department)}", SUB),
               Paragraph(f"<b>Month:</b> {res.period.strftime('%B %Y')}", SUB),
-              Paragraph(f"<b>Generated:</b> {generated.strftime('%d %B %Y, %H:%M')}", SUB), PageBreak()]
+              Paragraph(f"<b>Generated:</b> {generated.strftime('%d %B %Y, %H:%M')}", SUB)]
+    if res.office_hours:
+        story.append(Paragraph("<b>Counts:</b> office hours only; calls after hours, on weekends and on excluded "
+                               "days are shown separately", SUB))
+    story.append(PageBreak())
 
+    scope = " Office hours only (see the last section for calls outside office hours)." if res.office_hours else ""
     for i, (name, df) in enumerate(res.tables.items()):
         heading = f"Extension Call Stats - {escape(res.department)}" if i == 0 else f"{name} calls"
         story += [CondPageBreak(7 * cm), Paragraph(heading, H1 if i == 0 else H2), _table(df),
-                  Paragraph(NOTES[name].format(internal=" + internal" if res.include_internal else ""), NOTE),
+                  Paragraph(NOTES[name].format(internal=" + internal" if res.include_internal else "") + scope, NOTE),
                   Spacer(1, 0.8 * cm)]
+
+    if res.office_hours:
+        story += [PageBreak(), Paragraph("Calls outside office hours", H1),
+                  Paragraph(escape(res.hours_note), NOTE), Spacer(1, 0.3 * cm), _outside_table(res.outside),
+                  Paragraph("These call legs are not included in the tables above. A call is counted once: on an "
+                            "excluded day first, then on a weekend, then after hours.", NOTE),
+                  Spacer(1, 0.6 * cm), CondPageBreak(7 * cm), Paragraph("Outside office hours by extension", H2),
+                  _table(res.outside_by_extension),
+                  Paragraph("All call legs outside office hours (after hours, weekends and excluded days together).",
+                            NOTE)]
 
     a = res.audit
     story += [PageBreak(), Paragraph("Audit", H1)]
@@ -114,10 +143,20 @@ def build_ext_stats_xlsx(res: ExtStatsResult, title: str = DEFAULT_TITLE, genera
         ("Total calls", f"{t['Total Calls']:,}"), ("Answered", f"{t['Answered']:,}"), ("Answer %", f"{t['Answer %']:.1f}"),
         ("Includes internal calls", "Yes" if res.include_internal else "No"),
     ], columns=["Measure", "Value"])
+    if res.office_hours:
+        extra = [("Counts", "Office hours only"), ("Office hours", res.hours_note)]
+        extra += [(f"Outside office hours: {r['Period']}".replace(": Total outside office hours", " (total)"),
+                   f"{r['Total Calls']:,}") for r in res.outside.to_dict("records")]
+        summary = pd.concat([summary, pd.DataFrame(extra, columns=["Measure", "Value"])], ignore_index=True)
+    tables = dict(res.tables)
+    if res.office_hours:
+        tables["Outside hours by extension"] = res.outside_by_extension
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         summary.to_excel(xw, sheet_name="Summary", index=False)
-        for name, df in res.tables.items():
+        if res.office_hours:
+            res.outside.to_excel(xw, sheet_name="Outside office hours", index=False)
+        for name, df in tables.items():
             tr = total_row(df)
             body = pd.concat([df, pd.DataFrame([{"Extension": "TOTAL", "Name": "", **tr}])], ignore_index=True)
             body.to_excel(xw, sheet_name=name, index=False)
