@@ -28,6 +28,7 @@ yeastar_transfer_report/
     ├── queue_mapping.py       # Queue mapping loader (Queue overflow report)
     ├── queue_overflow.py      # Queue visits, routing type, outcomes, exceptions
     ├── queue_report.py        # Queue overflow PDF + Excel
+    ├── hours.py               # Office hours, weekends, excluded / short days, SA public holidays
     └── pdf_report.py          # ReportLab PDF
 ```
 
@@ -165,6 +166,24 @@ files, or select exports stored in `CDR_Example/`, pick one or more queues and c
   report month uses that time; visits that rang for 1 second or less are not counted (change this in the sidebar to
   match the PBX's "exclude calls within X seconds" settings). Overlapping exports are counted once.
 * Tests: `python -m pytest tests/test_queue_overflow.py`.
+
+## Office hours (Extension call stats and Queue overflow)
+
+In the sidebar, **Exclude after-hours, weekends and excluded days** is ticked by default. While it is ticked:
+
+* The report's tables count only calls that started during office hours (default 08:00 up to, but not including,
+  16:30, Monday to Friday). Queue visits use the time the call entered the queue.
+* Calls after hours, on weekends and on excluded days are counted separately: an **Outside office hours** tab in
+  the app, a section in the PDF, and extra sheets in the Excel file (by group, by extension or queue, and, for
+  queues, the full detail). A call is counted once: on an excluded day first, then on a weekend, then after hours.
+* **Excluded and short days** (sidebar expander) are pre-filled with South Africa's public holidays for the report
+  year, including the Monday off when a holiday falls on a Sunday. Add rows for once-off closures. For a day the
+  office closes early, choose *Short day* and enter the closing time; calls after it count as after hours.
+  **Save these days for next time** writes the list for that year to `excluded_days.xlsx` next to `app.py`; once a
+  year has been saved, the saved list is used instead of the pre-filled holidays.
+* The totals then no longer match the PBX's own reports, which count every hour. Untick the box for PBX-comparable
+  totals.
+* Tests: `python -m pytest tests/test_office_hours.py`.
 
 ## Overlapping files
 

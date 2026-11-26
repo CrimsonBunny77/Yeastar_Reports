@@ -12,8 +12,8 @@ from reportlab.platypus import CondPageBreak, PageBreak, Paragraph, SimpleDocTem
 from .calls_report import DT_FMT, _section, _table, _trim, safe_filename
 from .overlap import overlap_note
 from .pdf_report import H1, H2, NOTE, PAGE, SUB, TITLE, _logo_flowable, _make_footer
-from .queue_overflow import (DETAIL_COLS, FINAL_COLS, PERCENT_COLS, QueueResult, ROUTING_COLS, ROUTING_TYPES,
-                             SUMMARY_COLS)
+from .queue_overflow import (DETAIL_COLS, FINAL_COLS, OUTSIDE_COLS, PERCENT_COLS, QueueResult, ROUTING_COLS,
+                             ROUTING_TYPES, SUMMARY_COLS)
 
 DEFAULT_TITLE = "Queue Overflow Report"
 
@@ -29,6 +29,8 @@ def _wrap(text: str) -> Paragraph:
 def _stat_rows(res: QueueResult, generated: datetime) -> list[list]:
     a = res.audit
     rows = [["Report period", res.period.strftime("%B %Y")], ["Generated", generated.strftime("%d/%m/%Y %H:%M")]]
+    if res.office_hours:
+        rows.append(["Counts", "Office hours only"])
     if a.first_call is not None:
         rows.append(["Data in the uploaded files covers", f"{a.first_call:%d/%m/%Y %H:%M} - {a.last_call:%d/%m/%Y %H:%M}"])
     return rows + [[k, f"{v:,}"] for k, v in res.stats.items()]
@@ -125,6 +127,22 @@ def build_queue_pdf(res: QueueResult, title: str = DEFAULT_TITLE, logo: bytes | 
                         "(how the whole call ended). This can differ from the visit status above.", NOTE),
               PageBreak()]
 
+    # Visits outside office hours (only when office hours were applied)
+    if res.office_hours:
+        story += [Paragraph("Queue visits outside office hours", H1), Paragraph(escape(res.hours_note), NOTE),
+                  Spacer(1, 0.3 * cm),
+                  _table([c.replace(" ", "\n", 1) for c in OUTSIDE_COLS],
+                         [[r["Period"]] + [_int(r[c]) for c in OUTSIDE_COLS[1:]] for _, r in res.outside.iterrows()],
+                         [7.5 * cm] + [2.6 * cm] * (len(OUTSIDE_COLS) - 1), right=tuple(range(1, len(OUTSIDE_COLS)))),
+                  Spacer(1, 0.15 * cm),
+                  Paragraph("These queue visits are not included in the tables above. Total Calls counts queue "
+                            "visits; a visit is counted once: excluded day first, then weekend, then after hours.",
+                            NOTE),
+                  CondPageBreak(7 * cm), Spacer(1, 0.6 * cm), Paragraph("Outside office hours by queue", H2),
+                  _table([head.get(c, c.replace(" ", "\n", 1)) for c in SUMMARY_COLS],
+                         _summary_rows(res.outside_summary), w, right=tuple(range(2, len(SUMMARY_COLS)))),
+                  PageBreak()]
+
     # Detail, exceptions
     _section(story, "Call detail (one row per queue visit)", res.detail, _detail_rows,
              ["Time", "Call ID", "Caller", "Queue", "Agent", "Status", "Ring", "Talk", "Routing Type", "Final Status"],
@@ -189,6 +207,10 @@ def build_queue_xlsx(res: QueueResult, title: str = DEFAULT_TITLE, generated: da
                 ("Included: calls that are not inbound (internal / outbound)", a.non_inbound),
                 ("Not reported: inbound calls to a queue missing from the mapping", a.unmapped_queue_calls),
                 ("Duplicate call records removed", a.duplicates_removed)]
+    if res.office_hours:
+        summary += [("Counts", "Office hours only"), ("Office hours", res.hours_note)]
+        summary += [(f"Outside office hours: {r['Period']} (queue visits)", r["Total Calls"])
+                    for _, r in res.outside.iterrows()]
     sheets = {
         "Summary": pd.DataFrame(summary, columns=["Measure", "Value"]).astype({"Value": str}),
         "By queue": res.summary,
@@ -198,6 +220,11 @@ def build_queue_xlsx(res: QueueResult, title: str = DEFAULT_TITLE, generated: da
         "Exceptions": res.exceptions,
         "Definitions": pd.DataFrame(res.definitions, columns=["Term", "Definition"]),
     }
+    if res.office_hours:
+        sheets = {**{k: sheets[k] for k in ("Summary", "By queue", "Routing type", "Final status")},
+                  "Outside office hours": res.outside, "Outside hours by queue": res.outside_summary,
+                  "Detail": sheets["Detail"], "Outside hours detail": res.outside_detail[DETAIL_COLS],
+                  **{k: sheets[k] for k in ("Exceptions", "Definitions")}}
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         for name, df in sheets.items():
@@ -209,7 +236,7 @@ def build_queue_xlsx(res: QueueResult, title: str = DEFAULT_TITLE, generated: da
                 cell.fill = header_fill
                 cell.alignment = Alignment(vertical="center")
             for col in ws.iter_cols(min_row=2):
-                if ws.cell(row=1, column=col[0].column).value in ("Time", "Call Time"):
+                if col and ws.cell(row=1, column=col[0].column).value in ("Time", "Call Time"):
                     for cell in col:
                         cell.number_format = "dd/mm/yyyy hh:mm:ss"
             ws.freeze_panes = "A2"

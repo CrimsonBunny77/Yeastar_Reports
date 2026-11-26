@@ -7,6 +7,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_MAPPING_PATH = BASE_DIR / "department_mapping.xlsx"
 DEFAULT_QUEUE_MAPPING_PATH = BASE_DIR / "Que_Mapping_Table.xlsx"  # queue number -> queue name (Queue overflow report)
 DEFAULT_CDR_DIR = BASE_DIR / "CDR_Example"  # CDR exports stored with the app, selectable in the Queue overflow report
+# Excluded days (public holidays, once-off closures) and short days saved from the sidebar; see hours.py.
+DEFAULT_EXCLUDED_DAYS_PATH = BASE_DIR / "excluded_days.xlsx"
 
 # Columns that must exist in every CDR file.
 REQUIRED_COLUMNS = ("Communication Type", "Call From", "Last Status")
