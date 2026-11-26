@@ -189,15 +189,18 @@ report_title = c1.text_input("Report name", value={REPORT_TYPES[0]: "Yeastar Tra
                              key=f"title_{mode}",
                              help="Shown on the cover page and used in the file names.").strip()
 month_names = list(calendar.month_name)[1:]
-month_name = c2.selectbox("Report month", month_names, index=prev_month.month - 1)
+month_name = c2.selectbox("Report month", month_names, index=None, placeholder="Please Select Month")
 year = int(c3.number_input("Year", min_value=2000, max_value=2100, value=prev_month.year, step=1))
-period = pd.Period(year=year, month=month_names.index(month_name) + 1, freq="M")
+# The month is mandatory: no report can be generated until one is chosen.
+period = pd.Period(year=year, month=month_names.index(month_name) + 1, freq="M") if month_name else None
+if period is None:
+    st.warning("Please select the report month to enable report generation.")
 
 
 
 # ================================================================ transfer report
 def render_transfer_report():
-    can_run = bool(files) and mapping is not None and bool(selected)
+    can_run = period is not None and bool(files) and mapping is not None and bool(selected)
     generate = st.button("Generate Transfer Report", type="primary", disabled=not can_run)
 
     # ---------------------------------------------------------------- processing
@@ -304,7 +307,7 @@ def render_call_list():
     department = st.selectbox("Department", [ALL_DEPARTMENTS] + departments, key="calls_department",
                               help="Populated from the department mapping file. Choose 'All departments' for "
                                    "one combined list.") if departments else None
-    can_run = bool(files) and mapping is not None and department is not None
+    can_run = period is not None and bool(files) and mapping is not None and department is not None
     generate = st.button("Generate Call List", type="primary", disabled=not can_run)
 
     if generate:
@@ -401,7 +404,7 @@ def render_ext_stats():
     include_internal = o1.checkbox("Include internal calls", value=True, key="ext_internal",
                                    help="Counts calls between extensions too. The PBX's own report ('All') includes them.")
     hide_idle = o2.checkbox("Hide extensions with no calls", value=False, key="ext_hide_idle")
-    can_run = bool(files) and mapping is not None and department is not None
+    can_run = period is not None and bool(files) and mapping is not None and department is not None
     generate = st.button("Generate Extension Stats", type="primary", disabled=not can_run)
 
     if generate:
@@ -469,7 +472,7 @@ def render_ext_stats():
 
 # ================================================================ queue overflow report
 def render_queue_overflow():
-    can_run = (bool(files) or bool(stored_cdr)) and queue_map is not None and bool(selected_queues)
+    can_run = period is not None and (bool(files) or bool(stored_cdr)) and queue_map is not None and bool(selected_queues)
     generate = st.button("Generate Queue Overflow Report", type="primary", disabled=not can_run)
 
     if generate:
@@ -588,7 +591,7 @@ def render_queue_overflow():
 def render_ext_performance():
     department = st.selectbox("Department", departments, key="perf_department",
                               help="Populated from the department mapping file.") if departments else None
-    can_run = bool(files) and mapping is not None and department is not None
+    can_run = period is not None and bool(files) and mapping is not None and department is not None
     generate = st.button("Generate Extension Performance Detail", type="primary", disabled=not can_run)
 
     if generate:
